@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Local Mela exports and generated importer artifacts
+*.melarecipe
+*.melarecipes
+*.melarecipes.import-state.json
+*.melarecipes.import-log.jsonl
