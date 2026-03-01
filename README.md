@@ -33,6 +33,36 @@ Install the dependency:
 pip install -r requirements.txt
 ```
 
+## Quick Start
+
+1. Export your recipes from Mela as `Recipes.melarecipes`.
+2. Create a Mealie backup and API token.
+3. Run a dry run:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes --dry-run
+```
+
+4. Run one live batch of 100:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --batch-size 100 \
+  --max-batches 1 \
+  --cleanup-on-failure \
+  --stop-after-batch-error
+```
+
+5. Check progress:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes --summary
+```
+
+6. Re-run the same live command without `--max-batches 1` to continue.
+
 ## Files
 
 - `mela_to_mealie_import.py`: importer script
@@ -41,6 +71,7 @@ pip install -r requirements.txt
 - `Recipes.melarecipes.import-log.jsonl`: generated import log
 
 The state and log files are created automatically during live imports.
+You can override their locations with `--state-file` and `--log-file`.
 
 ## Mealie Preparation
 
@@ -123,3 +154,4 @@ This makes it safe to stop and rerun the importer without manually tracking offs
 - The importer uploads only the first image in each Mela recipe because Mealie uses a single primary recipe image.
 - The importer writes local state and log files in the working directory by default. These should not be committed.
 - For very large exports, `--summary` scans the archive to calculate a true remaining count, so it can take a little time.
+- The project is licensed under the MIT License. See `LICENSE`.
