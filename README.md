@@ -19,7 +19,7 @@ The importer is designed to be safe for large, real-world migrations:
 - Uploads the first embedded Mela image as the Mealie recipe image
 - Tracks imported recipes by Mela recipe ID (or archive filename fallback)
 - Writes resumable state and append-only logs
-- Supports `--dry-run`, `--summary`, and `--retry-failed`
+- Supports `--dry-run`, `--summary`, `--retry-failed`, and integrated ingredient repair
 
 ## Requirements
 
@@ -62,6 +62,16 @@ python3 mela_to_mealie_import.py Recipes.melarecipes --summary
 ```
 
 6. Re-run the same live command without `--max-batches 1` to continue.
+
+7. If needed, repair any Mealie placeholder ingredients:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-placeholder-ingredients \
+  --placeholder-only
+```
 
 ## Files
 
@@ -140,6 +150,29 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --stop-after-batch-error
 ```
 
+### Repair placeholder ingredients
+
+If a small number of recipes end up with Mealie's placeholder ingredient row (`Could not detect ingredients`), the importer can repair them from the original Mela ingredient lines:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-placeholder-ingredients \
+  --placeholder-only
+```
+
+Preview only:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-placeholder-ingredients \
+  --placeholder-only \
+  --dry-run
+```
+
 ## How resume and duplicate protection work
 
 - Each recipe is tracked in the state file using the Mela recipe `id` when present.
@@ -154,4 +187,5 @@ This makes it safe to stop and rerun the importer without manually tracking offs
 - The importer uploads only the first image in each Mela recipe because Mealie uses a single primary recipe image.
 - The importer writes local state and log files in the working directory by default. These should not be committed.
 - For very large exports, `--summary` scans the archive to calculate a true remaining count, so it can take a little time.
+- Ingredient repair uses the original Mela ingredient lines and patches them back into Mealie as plain rows, which is compatible with Mealie v3.11.0.
 - The project is licensed under the MIT License. See `LICENSE`.

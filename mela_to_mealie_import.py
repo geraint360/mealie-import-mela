@@ -163,6 +163,66 @@ def decode_first_image(recipe: dict) -> tuple[bytes, str] | None:
     return data, detect_image_extension(data)
 
 
+def extract_ingredient_lines_and_titles(ingredients_text: str | None) -> tuple[list[str], dict[int, str]]:
+    lines: list[str] = []
+    titles_by_index: dict[int, str] = {}
+    pending_title: str | None = None
+
+    for raw_line in (ingredients_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            pending_title = line.lstrip("#").strip()
+            continue
+        idx = len(lines)
+        lines.append(line)
+        if pending_title:
+            titles_by_index[idx] = pending_title
+            pending_title = None
+
+    return lines, titles_by_index
+
+
+def has_placeholder_ingredient(existing_ingredients: list[dict]) -> bool:
+    if len(existing_ingredients) != 1:
+        return False
+    only = existing_ingredients[0]
+    if not isinstance(only, dict):
+        return False
+    return (only.get("note") or "").strip() == "Could not detect ingredients"
+
+
+def build_plain_repaired_ingredients(
+    original_lines: list[str],
+    titles_by_index: dict[int, str],
+    existing_ingredients: list[dict],
+) -> list[dict]:
+    repaired: list[dict] = []
+
+    for idx, line in enumerate(original_lines):
+        ingredient: dict = {}
+        if idx < len(existing_ingredients) and isinstance(existing_ingredients[idx], dict):
+            ingredient.update(existing_ingredients[idx])
+
+        ingredient["referenceId"] = ingredient.get("referenceId") or str(uuid.uuid4())
+        ingredient["quantity"] = ingredient.get("quantity") or 0.0
+        ingredient["unit"] = None
+        ingredient["food"] = None
+        ingredient["referencedRecipe"] = None
+        ingredient["note"] = line
+        ingredient["display"] = line
+        ingredient["originalText"] = line
+
+        title = titles_by_index.get(idx)
+        if title:
+            ingredient["title"] = title
+
+        repaired.append(ingredient)
+
+    return repaired
+
+
 def recipe_date_fields(mela_recipe: dict) -> dict:
     raw = mela_recipe.get("date")
     if raw is None:
@@ -309,6 +369,15 @@ def count_archive_entries(export_path: Path) -> int:
     return count
 
 
+def archive_identity_stats(export_path: Path) -> tuple[int, int]:
+    identities: set[str] = set()
+    total = 0
+    for entry in iter_mela_archive(export_path):
+        total += 1
+        identities.add(recipe_identity(entry))
+    return total, len(identities)
+
+
 def recipe_identity(entry: RecipeEntry) -> str:
     recipe_id = entry.recipe.get("id")
     if recipe_id:
@@ -398,6 +467,10 @@ def processed_successfully(state: dict, identity: str) -> bool:
     return bool(item and item.get("status") in {"imported", "skipped_existing"})
 
 
+def is_tracked(state: dict, identity: str) -> bool:
+    return identity in state.get("processed", {})
+
+
 def failed_identities(state: dict) -> set[str]:
     return {
         identity
@@ -444,19 +517,24 @@ def stream_entries(
     batch_size: int,
     start_index: int,
     retry_failed_only: bool,
+    retry_missing_only: bool,
 ) -> list[RecipeEntry]:
     selected: list[RecipeEntry] = []
     failed_only = failed_identities(state) if retry_failed_only else set()
     for entry in iter_mela_archive(export_path):
-        if entry.index < start_index:
-            continue
         identity = recipe_identity(entry)
         if retry_failed_only:
             if identity not in failed_only:
                 continue
-        elif processed_successfully(state, identity):
-            state["last_scanned_index"] = max(state.get("last_scanned_index", -1), entry.index)
-            continue
+        elif retry_missing_only:
+            if is_tracked(state, identity):
+                continue
+        else:
+            if entry.index < start_index:
+                continue
+            if processed_successfully(state, identity):
+                state["last_scanned_index"] = max(state.get("last_scanned_index", -1), entry.index)
+                continue
         selected.append(entry)
         if len(selected) >= batch_size:
             break
@@ -479,9 +557,24 @@ class MealieClient:
         response.raise_for_status()
         return response.json()
 
+    def request_with_retry(self, method: str, url: str, retries: int = 3, **kwargs):
+        last_exc: requests.RequestException | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                return self.session.request(method, url, **kwargs)
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt == retries:
+                    raise
+                time.sleep(min(2.0, 0.5 * attempt))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("unreachable")
+
     def get_or_create_organizer(self, kind: str, name: str) -> dict:
         slug = slugify(name)
-        existing = self.session.get(
+        existing = self.request_with_retry(
+            "GET",
             f"{self.base_url}/api/organizers/{kind}/slug/{slug}",
             timeout=30,
         )
@@ -489,10 +582,11 @@ class MealieClient:
             data = existing.json()
             return {"id": data["id"], "name": data["name"], "slug": data["slug"]}
 
-        if existing.status_code not in (404,):
+        if existing.status_code not in (404, 500):
             existing.raise_for_status()
 
-        create = self.session.post(
+        create = self.request_with_retry(
+            "POST",
             f"{self.base_url}/api/organizers/{kind}",
             json={"name": name},
             timeout=30,
@@ -503,7 +597,8 @@ class MealieClient:
 
         if create.status_code in (409, 500):
             # Some Mealie versions return 500 instead of 409 for duplicate organizers.
-            retry_existing = self.session.get(
+            retry_existing = self.request_with_retry(
+                "GET",
                 f"{self.base_url}/api/organizers/{kind}/slug/{slug}",
                 timeout=30,
             )
@@ -516,8 +611,16 @@ class MealieClient:
         create.raise_for_status()
         raise RuntimeError(f"Failed to create {kind[:-1]}: {name}")
 
+    def safe_get_or_create_organizer(self, kind: str, name: str) -> dict | None:
+        try:
+            return self.get_or_create_organizer(kind, name)
+        except requests.RequestException as exc:
+            print(f"  Warning: could not prepare {kind[:-1]} '{name}': {exc}")
+            return None
+
     def create_recipe_stub(self, name: str) -> str:
-        response = self.session.post(
+        response = self.request_with_retry(
+            "POST",
             f"{self.base_url}/api/recipes",
             json={"name": name},
             timeout=30,
@@ -528,7 +631,8 @@ class MealieClient:
             response.raise_for_status()
 
         unique_name = f"{name} (mela-{int(time.time())})"
-        retry = self.session.post(
+        retry = self.request_with_retry(
+            "POST",
             f"{self.base_url}/api/recipes",
             json={"name": unique_name},
             timeout=30,
@@ -537,7 +641,8 @@ class MealieClient:
         return retry.text.strip().strip('"')
 
     def patch_recipe(self, slug: str, payload: dict) -> None:
-        response = self.session.patch(
+        response = self.request_with_retry(
+            "PATCH",
             f"{self.base_url}/api/recipes/{slug}",
             json=payload,
             timeout=60,
@@ -545,7 +650,11 @@ class MealieClient:
         response.raise_for_status()
 
     def delete_recipe(self, slug: str) -> None:
-        response = self.session.delete(f"{self.base_url}/api/recipes/{slug}", timeout=30)
+        response = self.request_with_retry(
+            "DELETE",
+            f"{self.base_url}/api/recipes/{slug}",
+            timeout=30,
+        )
         if response.status_code not in (200, 202, 204, 404):
             response.raise_for_status()
 
@@ -556,7 +665,8 @@ class MealieClient:
 
         try:
             with tmp_path.open("rb") as handle:
-                response = self.session.put(
+                response = self.request_with_retry(
+                    "PUT",
                     f"{self.base_url}/api/recipes/{slug}/image",
                     files={"image": (f"recipe.{extension}", handle, f"image/{extension}")},
                     data={"extension": extension},
@@ -567,7 +677,15 @@ class MealieClient:
             tmp_path.unlink(missing_ok=True)
 
     def recipe_exists_by_slug(self, slug: str) -> bool:
-        response = self.session.get(f"{self.base_url}/api/recipes/{slug}", timeout=30)
+        try:
+            response = self.request_with_retry(
+                "GET",
+                f"{self.base_url}/api/recipes/{slug}",
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            print(f"  Warning: could not check existing recipe slug '{slug}': {exc}")
+            return False
         if response.status_code == 200:
             return True
         if response.status_code == 404:
@@ -577,6 +695,17 @@ class MealieClient:
 
     def recipe_slug_exists(self, slug: str) -> bool:
         return self.recipe_exists_by_slug(slug)
+
+    def get_recipe(self, slug: str) -> dict | None:
+        response = self.request_with_retry(
+            "GET",
+            f"{self.base_url}/api/recipes/{slug}",
+            timeout=60,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
 
 
 def print_dry_run_summary(entry: RecipeEntry, payload: dict) -> None:
@@ -594,7 +723,7 @@ def print_dry_run_summary(entry: RecipeEntry, payload: dict) -> None:
 
 def print_import_summary(export_path: Path, state_path: Path, log_path: Path) -> int:
     state = load_state(state_path, export_path)
-    total = count_archive_entries(export_path)
+    total, unique_identities = archive_identity_stats(export_path)
     processed = state.get("processed", {})
 
     imported = 0
@@ -613,7 +742,10 @@ def print_import_summary(export_path: Path, state_path: Path, log_path: Path) ->
         else:
             other += 1
 
-    remaining = max(total - imported - skipped_existing - failed, 0)
+    tracked = len(processed)
+    duplicate_source_entries = max(total - unique_identities, 0)
+    unique_outstanding = max(unique_identities - tracked, 0)
+    index_gaps = max(total - tracked, 0)
 
     log_counts: dict[str, int] = {}
     recent_failures: list[dict] = []
@@ -626,13 +758,16 @@ def print_import_summary(export_path: Path, state_path: Path, log_path: Path) ->
     print(f"Archive: {export_path.name}")
     print(f"State file: {state_path}")
     print(f"Log file: {log_path}")
-    print(f"Total recipes: {total}")
+    print(f"Total archive entries: {total}")
+    print(f"Unique source recipes: {unique_identities}")
+    print(f"Duplicate source entries: {duplicate_source_entries}")
     print(f"Imported: {imported}")
     print(f"Skipped existing: {skipped_existing}")
     print(f"Failed: {failed}")
     if other:
         print(f"Other tracked statuses: {other}")
-    print(f"Remaining: {remaining}")
+    print(f"Unique outstanding: {unique_outstanding}")
+    print(f"Index gaps (not true outstanding if duplicates exist): {index_gaps}")
     print(f"Last scanned index: {state.get('last_scanned_index', -1)}")
     print(f"Tracked slug mappings: {len(state.get('slug_map', {}))}")
 
@@ -654,6 +789,121 @@ def print_import_summary(export_path: Path, state_path: Path, log_path: Path) ->
     return 0
 
 
+def run_placeholder_repair(
+    args: argparse.Namespace,
+    export_path: Path,
+    client: MealieClient,
+    state: dict,
+    log_path: Path,
+) -> int:
+    slug_map: dict[str, str] = state.get("slug_map", {})
+    if not slug_map:
+        print("State file has no slug mappings.")
+        return 1
+
+    title_filter = args.repair_title_contains.lower() if args.repair_title_contains else None
+    source_lookup: dict[str, RecipeEntry] = {}
+    needed = set(slug_map.keys())
+
+    for entry in iter_mela_archive(export_path):
+        identity = recipe_identity(entry)
+        if identity in needed and identity not in source_lookup:
+            source_lookup[identity] = entry
+
+    checked = 0
+    repaired = 0
+    skipped = 0
+    errors = 0
+
+    for identity, slug in slug_map.items():
+        entry = source_lookup.get(identity)
+        if not entry:
+            skipped += 1
+            continue
+
+        title = entry.recipe.get("title") or "Untitled"
+        if title_filter and title_filter not in title.lower():
+            skipped += 1
+            continue
+
+        lines, titles_by_index = extract_ingredient_lines_and_titles(entry.recipe.get("ingredients"))
+        if not lines:
+            skipped += 1
+            continue
+
+        checked += 1
+        if checked % 250 == 0:
+            print(
+                f"Checked {checked}/{len(slug_map)}; repaired {repaired}; skipped {skipped}; errors {errors}"
+            )
+
+        try:
+            current_recipe = client.get_recipe(slug)
+            if not current_recipe:
+                skipped += 1
+                continue
+
+            existing_ingredients = current_recipe.get("recipeIngredient") or []
+            if args.placeholder_only and not has_placeholder_ingredient(existing_ingredients):
+                skipped += 1
+                continue
+
+            payload = {
+                "recipeIngredient": build_plain_repaired_ingredients(
+                    lines,
+                    titles_by_index,
+                    existing_ingredients,
+                )
+            }
+
+            if args.dry_run:
+                print(f"Would repair: {title}")
+                repaired += 1
+                if args.limit is not None and repaired >= args.limit:
+                    break
+                continue
+
+            client.patch_recipe(slug, payload)
+            append_log(
+                log_path,
+                {
+                    "timestamp": now_utc_iso(),
+                    "identity": identity,
+                    "title": title,
+                    "status": "ingredients_repaired",
+                    "slug": slug,
+                },
+            )
+            print(f"Repaired: {title}")
+            repaired += 1
+            time.sleep(args.delay_seconds)
+
+            if args.limit is not None and repaired >= args.limit:
+                break
+        except requests.RequestException as exc:
+            errors += 1
+            append_log(
+                log_path,
+                {
+                    "timestamp": now_utc_iso(),
+                    "identity": identity,
+                    "title": title,
+                    "status": "ingredients_repair_failed",
+                    "slug": slug,
+                    "error": str(exc),
+                },
+            )
+            print(f"Error repairing {title}: {exc}")
+            if args.stop_on_error:
+                break
+
+    action = "Would repair" if args.dry_run else "Repaired"
+    print(f"{action}: {repaired}")
+    print(f"Skipped: {skipped}")
+    print(f"Errors: {errors}")
+    return 0 if errors == 0 else 2
+
+
 def run_import(args: argparse.Namespace) -> int:
     export_path = Path(args.export).expanduser()
     if not export_path.exists():
@@ -666,7 +916,11 @@ def run_import(args: argparse.Namespace) -> int:
     if args.summary:
         return print_import_summary(export_path, state_path, log_path)
 
-    if args.dry_run:
+    if args.retry_failed and args.retry_missing:
+        print("Use only one of --retry-failed or --retry-missing.")
+        return 1
+
+    if args.dry_run and not args.repair_placeholder_ingredients:
         dry_run_offset = args.offset if args.offset is not None else 0
         entries = load_selected_entries(export_path, args.limit, dry_run_offset)
         if not entries:
@@ -679,7 +933,10 @@ def run_import(args: argparse.Namespace) -> int:
         return 0
 
     if not args.url or not args.token:
-        print("Live mode requires --url and --token.")
+        if args.repair_placeholder_ingredients:
+            print("Repair mode requires --url and --token.")
+        else:
+            print("Live mode requires --url and --token.")
         return 1
 
     client = MealieClient(args.url, args.token)
@@ -687,6 +944,9 @@ def run_import(args: argparse.Namespace) -> int:
     print(f"Connected to Mealie {info.get('version', '?')} at {args.url}")
 
     state = load_state(state_path, export_path)
+
+    if args.repair_placeholder_ingredients:
+        return run_placeholder_repair(args, export_path, client, state, log_path)
 
     batch_size = args.batch_size if args.batch_size is not None else args.limit
     if batch_size is None or batch_size <= 0:
@@ -698,20 +958,51 @@ def run_import(args: argparse.Namespace) -> int:
     total_failures = 0
     created_slugs: list[str] = []
     batches_run = 0
+    performed_gap_sweep = False
 
     while True:
-        entries = stream_entries(export_path, state, batch_size, start_index, args.retry_failed)
+        entries = stream_entries(
+            export_path,
+            state,
+            batch_size,
+            start_index,
+            args.retry_failed,
+            args.retry_missing,
+        )
         save_state(state_path, state)
         if not entries:
-            if batches_run == 0:
-                if args.retry_failed:
-                    print("No failed recipes to retry.")
+            if not args.retry_failed and not args.retry_missing and not performed_gap_sweep:
+                recovery_entries = stream_entries(
+                    export_path,
+                    state,
+                    batch_size,
+                    0,
+                    False,
+                    True,
+                )
+                if recovery_entries:
+                    performed_gap_sweep = True
+                    entries = recovery_entries
+                    print("Normal resume found untracked gaps; switching to recovery sweep.")
                 else:
-                    print("No remaining recipes to import.")
-            break
+                    performed_gap_sweep = True
+            if not entries:
+                if batches_run == 0:
+                    if args.retry_failed:
+                        print("No failed recipes to retry.")
+                    elif args.retry_missing:
+                        print("No untracked recipes to recover.")
+                    else:
+                        print("No remaining recipes to import.")
+                break
 
         batches_run += 1
-        mode_label = "retry batch" if args.retry_failed else "batch"
+        if args.retry_failed:
+            mode_label = "retry batch"
+        elif args.retry_missing or performed_gap_sweep:
+            mode_label = "recovery batch"
+        else:
+            mode_label = "batch"
         print(f"{mode_label.title()} {batches_run}: selected {len(entries)} recipe(s) starting from index {entries[0].index}")
 
         category_names = sorted(
@@ -730,14 +1021,17 @@ def run_import(args: argparse.Namespace) -> int:
             if entry.recipe.get("wantToCook"):
                 tag_names.add("want-to-cook")
 
-        category_lookup = {
-            slugify(name): client.get_or_create_organizer("categories", name)
-            for name in category_names
-        }
-        tag_lookup = {
-            slugify(name): client.get_or_create_organizer("tags", name)
-            for name in sorted(tag_names)
-        }
+        category_lookup: dict[str, dict] = {}
+        for name in category_names:
+            organizer = client.safe_get_or_create_organizer("categories", name)
+            if organizer:
+                category_lookup[slugify(name)] = organizer
+
+        tag_lookup: dict[str, dict] = {}
+        for name in sorted(tag_names):
+            organizer = client.safe_get_or_create_organizer("tags", name)
+            if organizer:
+                tag_lookup[slugify(name)] = organizer
 
         batch_failures = 0
 
@@ -898,9 +1192,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show import progress summary from the state and log files",
     )
     parser.add_argument(
+        "--repair-placeholder-ingredients",
+        action="store_true",
+        help="Repair imported recipes that still have the Mealie placeholder ingredient",
+    )
+    parser.add_argument(
+        "--placeholder-only",
+        action="store_true",
+        help="When repairing, only touch recipes that currently have the placeholder ingredient",
+    )
+    parser.add_argument(
+        "--repair-title-contains",
+        help="When repairing, only touch recipes whose title contains this text",
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help="Retry only recipes currently marked failed in the state file",
+    )
+    parser.add_argument(
+        "--retry-missing",
+        action="store_true",
+        help="Retry only recipes with no tracked state entry",
     )
     parser.add_argument(
         "--limit",

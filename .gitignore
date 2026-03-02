@@ -6,3 +6,5 @@ __pycache__/
 *.melarecipes
 *.melarecipes.import-state.json
 *.melarecipes.import-log.jsonl
+*.json
+*.jsonl
