@@ -19,7 +19,7 @@ The importer is designed to be safe for large, real-world migrations:
 - Uploads the first embedded Mela image as the Mealie recipe image
 - Tracks imported recipes by Mela recipe ID (or archive filename fallback)
 - Writes resumable state and append-only logs
-- Supports `--dry-run`, `--summary`, `--retry-failed`, and integrated ingredient repair
+- Supports `--dry-run`, `--summary`, `--retry-failed`, integrated ingredient repair, and integrated author repair
 
 ## Requirements
 
@@ -71,6 +71,15 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --token YOUR_API_TOKEN \
   --repair-placeholder-ingredients \
   --placeholder-only
+```
+
+8. If needed, infer and store source authors from recipe titles:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-authors
 ```
 
 ## Files
@@ -173,6 +182,38 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --dry-run
 ```
 
+### Repair source authors
+
+If you want visible source-author attribution in Mealie, the importer can infer authors from common title patterns and store them in both `extras.sourceAuthor` and a visible `Source Author` note.
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-authors
+```
+
+Only fill missing author values:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-authors \
+  --author-only-missing
+```
+
+Preview only:
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-authors \
+  --dry-run \
+  --limit 10
+```
+
 ## How resume and duplicate protection work
 
 - Each recipe is tracked in the state file using the Mela recipe `id` when present.
@@ -188,4 +229,5 @@ This makes it safe to stop and rerun the importer without manually tracking offs
 - The importer writes local state and log files in the working directory by default. These should not be committed.
 - For very large exports, `--summary` scans the archive to calculate a true remaining count, so it can take a little time.
 - Ingredient repair uses the original Mela ingredient lines and patches them back into Mealie as plain rows, which is compatible with Mealie v3.11.0.
+- Author repair is best-effort because Mela does not export a dedicated author field; the importer infers author names from recipe titles and stores them separately from the recipe title.
 - The project is licensed under the MIT License. See `LICENSE`.

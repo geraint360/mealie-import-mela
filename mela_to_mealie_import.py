@@ -223,6 +223,165 @@ def build_plain_repaired_ingredients(
     return repaired
 
 
+def extract_source_author(mela_recipe: dict) -> str | None:
+    title = (mela_recipe.get("title") or "").strip()
+    if not title:
+        return None
+
+    if title.lower().startswith("ask ottolenghi:"):
+        return "Yotam Ottolenghi"
+
+    # Prefer explicit possessive name patterns anywhere in the title, taking
+    # the last plausible match to avoid headline prefixes.
+    possessive_matches = re.findall(r"([A-Z][^'’|:–-]*?(?:\s+[A-Z][^'’|:–-]*?){1,4})['’](?:s)?", title)
+    for candidate in reversed(possessive_matches):
+        candidate = candidate.strip(" -.,;:|–")
+        if is_probable_person_name(candidate):
+            return candidate
+
+    patterns = [
+        r"recipe by ([^|:.]+?)(?:[.|]|$)",
+        r"recipes by ([^|:.]+?)(?:[.|]|$)",
+        r":\s*([^:|]+?)['’](?:s)? [^|:]+$",
+        r"^([^:|]+?)['’](?:s)? recipe\b",
+        r"^([^:|]+?)['’](?:s)? recipes\b",
+        r"^([^:|]+?)['’](?:s)? .*?(?:\||$)",
+        r"\|\s*([^|]+?)$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, title, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip(" -.,;:|")
+            candidate = re.sub(r"['’]s\s+masterclass$", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s+masterclass$", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s+\|\s+.*$", "", candidate)
+            if is_probable_person_name(candidate):
+                return candidate
+
+    return None
+
+
+def source_author_from_recipe(recipe: dict | None) -> str | None:
+    if not isinstance(recipe, dict):
+        return None
+
+    extras = recipe.get("extras")
+    if isinstance(extras, dict):
+        value = (extras.get("sourceAuthor") or "").strip()
+        if value:
+            return value
+
+    for note in recipe.get("notes") or []:
+        if isinstance(note, dict) and (note.get("title") or "").strip().lower() == "source author":
+            value = (note.get("text") or "").strip()
+            if value:
+                return value
+
+    return None
+
+
+def is_probable_person_name(candidate: str | None) -> bool:
+    if not candidate:
+        return False
+
+    value = candidate.strip(" -.,;:|")
+    if not value:
+        return False
+
+    lowered = value.lower()
+    blocked_exact = {
+        "the good mixer",
+        "the sweet spot",
+        "waste not",
+        "a kitchen in rome",
+        "the new vegan",
+        "the new flexitarian",
+        "the simple fix",
+        "quick and easy",
+        "the guardian",
+        "food | the guardian",
+        "cup of jo",
+        "kitchen aide",
+        "the world",
+        "ask ottolenghi",
+        "food",
+    }
+    if lowered in blocked_exact:
+        return False
+
+    blocked_fragments = {
+        "guardian",
+        "masterclass",
+        "recipe",
+        "recipes",
+        "the good mixer",
+        "the sweet spot",
+        "quick and easy",
+        "the new vegan",
+        "the new flexitarian",
+        "the simple fix",
+        "the american canned",
+        "char siu pork",
+        "chips with everything",
+        "leek, spinach",
+    }
+    if any(fragment in lowered for fragment in blocked_fragments):
+        return False
+
+    parts = value.split()
+    if len(parts) < 2 or len(parts) > 6:
+        return False
+
+    connectors = {"and", "&", "de", "da", "del", "van", "von", "al", "bin", "di", "du", "la", "le", "lo", "y"}
+    good_tokens = 0
+    for part in parts:
+        stripped = part.strip("()[]{}'’.,;:-")
+        if not stripped:
+            continue
+        if stripped.lower() in connectors:
+            continue
+        if re.fullmatch(r"[A-Z]\.?", stripped):
+            good_tokens += 1
+            continue
+        if stripped[0].isalpha() and stripped[0].isupper():
+            good_tokens += 1
+
+    return good_tokens >= 2
+
+
+def merged_notes(
+    existing_notes: list | None,
+    source_author: str | None,
+    mela_recipe: dict | None = None,
+) -> list[dict]:
+    notes: list[dict] = []
+
+    for note in existing_notes or []:
+        if isinstance(note, dict):
+            if (note.get("title") or "").strip().lower() != "source author":
+                notes.append(dict(note))
+
+    if not existing_notes and mela_recipe is not None:
+        notes = notes_from_recipe(mela_recipe)
+
+    if source_author:
+        notes.append({"title": "Source Author", "text": source_author})
+
+    return notes
+
+
+def merged_extras(existing_extras: dict | None, source_author: str | None) -> dict:
+    extras: dict = {}
+    if isinstance(existing_extras, dict):
+        extras.update(existing_extras)
+    if source_author:
+        extras["sourceAuthor"] = source_author
+    else:
+        extras.pop("sourceAuthor", None)
+    return extras
+
+
 def recipe_date_fields(mela_recipe: dict) -> dict:
     raw = mela_recipe.get("date")
     if raw is None:
@@ -297,9 +456,15 @@ def build_recipe_payload(mela_recipe: dict, category_lookup: dict, tag_lookup: d
     date_fields = recipe_date_fields(mela_recipe)
     payload.update(date_fields)
 
-    notes = notes_from_recipe(mela_recipe)
+    source_author = extract_source_author(mela_recipe)
+
+    notes = merged_notes([], source_author, mela_recipe)
     if notes:
         payload["notes"] = notes
+
+    extras = merged_extras({}, source_author)
+    if extras:
+        payload["extras"] = extras
 
     categories = selected_categories(mela_recipe, category_lookup)
     if categories:
@@ -904,6 +1069,143 @@ def run_placeholder_repair(
     return 0 if errors == 0 else 2
 
 
+def run_author_repair(
+    args: argparse.Namespace,
+    export_path: Path,
+    client: MealieClient,
+    state: dict,
+    log_path: Path,
+) -> int:
+    slug_map: dict[str, str] = state.get("slug_map", {})
+    if not slug_map:
+        print("State file has no slug mappings.")
+        return 1
+
+    title_filter = args.repair_title_contains.lower() if args.repair_title_contains else None
+    source_lookup: dict[str, RecipeEntry] = {}
+    needed = set(slug_map.keys())
+
+    for entry in iter_mela_archive(export_path):
+        identity = recipe_identity(entry)
+        if identity in needed and identity not in source_lookup:
+            source_lookup[identity] = entry
+
+    checked = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    for identity, slug in slug_map.items():
+        entry = source_lookup.get(identity)
+        if not entry:
+            skipped += 1
+            continue
+
+        title = entry.recipe.get("title") or "Untitled"
+        if title_filter and title_filter not in title.lower():
+            skipped += 1
+            continue
+
+        source_author = extract_source_author(entry.recipe)
+
+        checked += 1
+        if checked % 250 == 0:
+            print(f"Checked {checked}/{len(slug_map)}; updated {updated}; skipped {skipped}; errors {errors}")
+
+        try:
+            current_recipe = client.get_recipe(slug)
+            if not current_recipe:
+                skipped += 1
+                continue
+
+            existing_extras = current_recipe.get("extras")
+            existing_notes = current_recipe.get("notes")
+            existing_author = source_author_from_recipe(current_recipe)
+
+            if args.author_only_missing:
+                if existing_author:
+                    skipped += 1
+                    continue
+            else:
+                if source_author == existing_author:
+                    skipped += 1
+                    continue
+
+            action_label = "Updated author"
+            payload: dict | None = None
+
+            if source_author:
+                payload = {
+                    "notes": merged_notes(existing_notes, source_author),
+                    "extras": merged_extras(existing_extras, source_author),
+                }
+            else:
+                if existing_author and not is_probable_person_name(existing_author):
+                    payload = {
+                        "notes": merged_notes(existing_notes, None),
+                        "extras": merged_extras(existing_extras, None),
+                    }
+                    action_label = "Cleared non-person author"
+                else:
+                    skipped += 1
+                    continue
+
+            if args.dry_run:
+                if source_author:
+                    print(f"Would set author '{source_author}' on: {title}")
+                else:
+                    print(f"Would clear non-person author on: {title}")
+                updated += 1
+                if args.limit is not None and updated >= args.limit:
+                    break
+                continue
+
+            client.patch_recipe(slug, payload)
+            append_log(
+                log_path,
+                {
+                    "timestamp": now_utc_iso(),
+                    "identity": identity,
+                    "title": title,
+                    "status": "author_repaired",
+                    "slug": slug,
+                    "source_author": source_author,
+                },
+            )
+            if source_author:
+                print(f"{action_label} '{source_author}': {title}")
+            else:
+                print(f"{action_label}: {title}")
+            updated += 1
+            time.sleep(args.delay_seconds)
+
+            if args.limit is not None and updated >= args.limit:
+                break
+        except requests.RequestException as exc:
+            errors += 1
+            append_log(
+                log_path,
+                {
+                    "timestamp": now_utc_iso(),
+                    "identity": identity,
+                    "title": title,
+                    "status": "author_repair_failed",
+                    "slug": slug,
+                    "error": str(exc),
+                    "source_author": source_author,
+                },
+            )
+            print(f"Error updating author for {title}: {exc}")
+            if args.stop_on_error:
+                break
+
+    action = "Would update" if args.dry_run else "Updated"
+    print(f"{action}: {updated}")
+    print(f"Skipped: {skipped}")
+    print(f"Errors: {errors}")
+    return 0 if errors == 0 else 2
+
+
 def run_import(args: argparse.Namespace) -> int:
     export_path = Path(args.export).expanduser()
     if not export_path.exists():
@@ -920,9 +1222,14 @@ def run_import(args: argparse.Namespace) -> int:
         print("Use only one of --retry-failed or --retry-missing.")
         return 1
 
-    if args.dry_run and not args.repair_placeholder_ingredients:
+    if args.repair_placeholder_ingredients and args.repair_authors:
+        print("Use only one of --repair-placeholder-ingredients or --repair-authors.")
+        return 1
+
+    if args.dry_run and not args.repair_placeholder_ingredients and not args.repair_authors:
         dry_run_offset = args.offset if args.offset is not None else 0
-        entries = load_selected_entries(export_path, args.limit, dry_run_offset)
+        dry_run_limit = args.limit if args.limit is not None else 2
+        entries = load_selected_entries(export_path, dry_run_limit, dry_run_offset)
         if not entries:
             print("No recipes selected.")
             return 1
@@ -948,7 +1255,10 @@ def run_import(args: argparse.Namespace) -> int:
     if args.repair_placeholder_ingredients:
         return run_placeholder_repair(args, export_path, client, state, log_path)
 
-    batch_size = args.batch_size if args.batch_size is not None else args.limit
+    if args.repair_authors:
+        return run_author_repair(args, export_path, client, state, log_path)
+
+    batch_size = args.batch_size if args.batch_size is not None else (args.limit if args.limit is not None else 2)
     if batch_size is None or batch_size <= 0:
         print("Batch size must be greater than zero.")
         return 1
@@ -1197,9 +1507,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repair imported recipes that still have the Mealie placeholder ingredient",
     )
     parser.add_argument(
+        "--repair-authors",
+        action="store_true",
+        help="Infer source authors from Mela titles and update imported recipes",
+    )
+    parser.add_argument(
         "--placeholder-only",
         action="store_true",
         help="When repairing, only touch recipes that currently have the placeholder ingredient",
+    )
+    parser.add_argument(
+        "--author-only-missing",
+        action="store_true",
+        help="When repairing authors, only touch recipes that do not already have a stored source author",
     )
     parser.add_argument(
         "--repair-title-contains",
@@ -1218,8 +1538,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit",
         type=int,
-        default=2,
-        help="Dry-run selection size, or live batch size when --batch-size is not set (default: 2)",
+        default=None,
+        help="Dry-run selection size, live batch size when --batch-size is not set, or optional cap for repair modes",
     )
     parser.add_argument(
         "--offset",
