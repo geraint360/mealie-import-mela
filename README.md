@@ -19,7 +19,7 @@ The importer is designed to be safe for large, real-world migrations:
 - Uploads the first embedded Mela image as the Mealie recipe image
 - Tracks imported recipes by Mela recipe ID (or archive filename fallback)
 - Writes resumable state and append-only logs
-- Supports `--dry-run`, `--summary`, `--retry-failed`, integrated ingredient repair, and integrated author repair
+- Supports `--dry-run`, `--summary`, `--retry-failed`, structured ingredient repair, and source author repair
 
 ## Requirements
 
@@ -63,14 +63,13 @@ python3 mela_to_mealie_import.py Recipes.melarecipes --summary
 
 6. Re-run the same live command without `--max-batches 1` to continue.
 
-7. If needed, repair any Mealie placeholder ingredients:
+7. If needed, repair unparsed ingredients into structured quantity/unit/food fields:
 
 ```bash
 python3 mela_to_mealie_import.py Recipes.melarecipes \
   --url http://your-mealie-host:9925 \
   --token YOUR_API_TOKEN \
-  --repair-placeholder-ingredients \
-  --placeholder-only
+  --repair-placeholder-ingredients
 ```
 
 8. If needed, infer and store source authors from recipe titles:
@@ -159,9 +158,19 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --stop-after-batch-error
 ```
 
-### Repair placeholder ingredients
+### Repair structured ingredients
 
-If a small number of recipes end up with Mealie's placeholder ingredient row (`Could not detect ingredients`), the importer can repair them from the original Mela ingredient lines:
+Ingredient repair parses original Mela ingredient lines via Mealie's parser and writes structured `quantity`, `unit`, and `food` fields.
+By default it only touches recipes whose current ingredient rows appear unparsed (safe mode).
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-placeholder-ingredients
+```
+
+Restrict to explicit placeholder rows only:
 
 ```bash
 python3 mela_to_mealie_import.py Recipes.melarecipes \
@@ -171,6 +180,16 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --placeholder-only
 ```
 
+Force repair across all mapped recipes (including already parsed ones):
+
+```bash
+python3 mela_to_mealie_import.py Recipes.melarecipes \
+  --url http://your-mealie-host:9925 \
+  --token YOUR_API_TOKEN \
+  --repair-placeholder-ingredients \
+  --all-ingredients
+```
+
 Preview only:
 
 ```bash
@@ -178,7 +197,6 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --url http://your-mealie-host:9925 \
   --token YOUR_API_TOKEN \
   --repair-placeholder-ingredients \
-  --placeholder-only \
   --dry-run
 ```
 

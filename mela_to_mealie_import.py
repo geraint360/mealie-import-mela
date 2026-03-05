@@ -193,6 +193,22 @@ def has_placeholder_ingredient(existing_ingredients: list[dict]) -> bool:
     return (only.get("note") or "").strip() == "Could not detect ingredients"
 
 
+def has_unparsed_ingredients(existing_ingredients: list[dict]) -> bool:
+    if not existing_ingredients:
+        return False
+    for ingredient in existing_ingredients:
+        if not isinstance(ingredient, dict):
+            continue
+        note = (ingredient.get("note") or "").strip()
+        display = (ingredient.get("display") or "").strip()
+        quantity = ingredient.get("quantity")
+        unit = ingredient.get("unit")
+        food = ingredient.get("food")
+        if (note or display) and not unit and not food and (quantity in (None, 0, 0.0)):
+            return True
+    return False
+
+
 def build_plain_repaired_ingredients(
     original_lines: list[str],
     titles_by_index: dict[int, str],
@@ -219,6 +235,77 @@ def build_plain_repaired_ingredients(
             ingredient["title"] = title
 
         repaired.append(ingredient)
+
+    return repaired
+
+
+def build_structured_repaired_ingredients(
+    lines: list[str],
+    titles_by_index: dict[int, str],
+    parsed_items: list[dict],
+    existing_ingredients: list[dict],
+    client: "MealieClient",
+) -> list[dict]:
+    repaired: list[dict] = []
+
+    for idx, line in enumerate(lines):
+        parsed = parsed_items[idx] if idx < len(parsed_items) else {}
+        ingredient = parsed.get("ingredient") if isinstance(parsed, dict) else {}
+        if not isinstance(ingredient, dict):
+            ingredient = {}
+
+        existing = existing_ingredients[idx] if idx < len(existing_ingredients) and isinstance(existing_ingredients[idx], dict) else {}
+        reference_id = (
+            ingredient.get("referenceId")
+            or existing.get("referenceId")
+            or str(uuid.uuid4())
+        )
+
+        unit_ref = None
+        parsed_unit = ingredient.get("unit")
+        if isinstance(parsed_unit, dict):
+            unit_ref = client.get_or_create_unit(parsed_unit)
+
+        food_ref = None
+        parsed_food = ingredient.get("food")
+        if isinstance(parsed_food, dict):
+            food_name = (parsed_food.get("name") or "").strip()
+            if food_name:
+                if parsed_food.get("id"):
+                    food_ref = {"id": parsed_food["id"], "name": food_name}
+                else:
+                    food_ref = client.get_or_create_food(food_name)
+
+        title = titles_by_index.get(idx)
+        if title is None:
+            raw_title = ingredient.get("title")
+            title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+
+        note = ingredient.get("note")
+        if not isinstance(note, str) or not note.strip():
+            note = line
+
+        display = ingredient.get("display")
+        if not isinstance(display, str) or not display.strip():
+            display = line
+
+        original_text = ingredient.get("originalText")
+        if not isinstance(original_text, str) or not original_text.strip():
+            original_text = line
+
+        repaired.append(
+            {
+                "quantity": ingredient.get("quantity", 0) or 0,
+                "unit": unit_ref,
+                "food": food_ref,
+                "referencedRecipe": None,
+                "note": note,
+                "display": display,
+                "title": title,
+                "originalText": original_text,
+                "referenceId": reference_id,
+            }
+        )
 
     return repaired
 
@@ -716,6 +803,8 @@ class MealieClient:
                 "Accept": "application/json",
             }
         )
+        self.food_cache_by_name: dict[str, dict] = {}
+        self.unit_cache_by_name: dict[str, dict] = {}
 
     def verify(self) -> dict:
         response = self.session.get(f"{self.base_url}/api/app/about", timeout=30)
@@ -872,6 +961,138 @@ class MealieClient:
         response.raise_for_status()
         return response.json()
 
+    def parse_ingredients(self, lines: list[str], parser: str = "nlp") -> list[dict]:
+        response = self.request_with_retry(
+            "POST",
+            f"{self.base_url}/api/parser/ingredients",
+            json={"ingredients": lines, "parser": parser},
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            return []
+        return data
+
+    def find_food(self, name: str) -> dict | None:
+        key = name.strip().lower()
+        if not key:
+            return None
+        if key in self.food_cache_by_name:
+            return self.food_cache_by_name[key]
+
+        response = self.request_with_retry(
+            "GET",
+            f"{self.base_url}/api/foods",
+            params={"search": name, "perPage": 25},
+            timeout=30,
+        )
+        response.raise_for_status()
+        items = (response.json() or {}).get("items") or []
+        for item in items:
+            if (item.get("name") or "").strip().lower() == key and item.get("id"):
+                resolved = {"id": item["id"], "name": item["name"]}
+                self.food_cache_by_name[key] = resolved
+                return resolved
+        return None
+
+    def get_or_create_food(self, name: str) -> dict | None:
+        key = name.strip().lower()
+        if not key:
+            return None
+        existing = self.find_food(name)
+        if existing:
+            return existing
+
+        create = self.request_with_retry(
+            "POST",
+            f"{self.base_url}/api/foods",
+            json={"name": name},
+            timeout=30,
+        )
+        if create.status_code in (200, 201):
+            data = create.json() or {}
+            if data.get("id") and data.get("name"):
+                resolved = {"id": data["id"], "name": data["name"]}
+                self.food_cache_by_name[key] = resolved
+                return resolved
+
+        if create.status_code in (400, 409, 500):
+            retry_existing = self.find_food(name)
+            if retry_existing:
+                return retry_existing
+
+        create.raise_for_status()
+        return None
+
+    def find_unit(self, name: str) -> dict | None:
+        key = name.strip().lower()
+        if not key:
+            return None
+        if key in self.unit_cache_by_name:
+            return self.unit_cache_by_name[key]
+
+        response = self.request_with_retry(
+            "GET",
+            f"{self.base_url}/api/units",
+            params={"search": name, "perPage": 25},
+            timeout=30,
+        )
+        response.raise_for_status()
+        items = (response.json() or {}).get("items") or []
+        for item in items:
+            item_name = (item.get("name") or "").strip().lower()
+            item_abbr = (item.get("abbreviation") or "").strip().lower()
+            if (item_name == key or item_abbr == key) and item.get("id"):
+                resolved = {"id": item["id"], "name": item["name"]}
+                self.unit_cache_by_name[key] = resolved
+                return resolved
+        return None
+
+    def get_or_create_unit(self, unit_payload: dict) -> dict | None:
+        unit_id = unit_payload.get("id")
+        unit_name = (unit_payload.get("name") or "").strip()
+        unit_abbreviation = (unit_payload.get("abbreviation") or "").strip()
+
+        if unit_id and unit_name:
+            resolved = {"id": unit_id, "name": unit_name}
+            self.unit_cache_by_name[unit_name.lower()] = resolved
+            if unit_abbreviation:
+                self.unit_cache_by_name[unit_abbreviation.lower()] = resolved
+            return resolved
+
+        search_term = unit_name or unit_abbreviation
+        if not search_term:
+            return None
+
+        existing = self.find_unit(search_term)
+        if existing:
+            return existing
+
+        create_payload = {"name": unit_name or unit_abbreviation}
+        create = self.request_with_retry(
+            "POST",
+            f"{self.base_url}/api/units",
+            json=create_payload,
+            timeout=30,
+        )
+        if create.status_code in (200, 201):
+            data = create.json() or {}
+            if data.get("id") and data.get("name"):
+                resolved = {"id": data["id"], "name": data["name"]}
+                self.unit_cache_by_name[resolved["name"].lower()] = resolved
+                if unit_abbreviation:
+                    self.unit_cache_by_name[unit_abbreviation.lower()] = resolved
+                return resolved
+
+        if create.status_code in (400, 409, 500):
+            retry_existing = self.find_unit(search_term)
+            if retry_existing:
+                return retry_existing
+
+        create.raise_for_status()
+        return None
+
 
 def print_dry_run_summary(entry: RecipeEntry, payload: dict) -> None:
     title = payload.get("name", "Untitled")
@@ -1013,11 +1234,27 @@ def run_placeholder_repair(
                 skipped += 1
                 continue
 
+            if not args.all_ingredients and not has_unparsed_ingredients(existing_ingredients):
+                skipped += 1
+                continue
+
+            parser_used = args.ingredient_parser
+            try:
+                parsed = client.parse_ingredients(lines, parser=parser_used)
+            except requests.RequestException:
+                if parser_used != "brute":
+                    parser_used = "brute"
+                    parsed = client.parse_ingredients(lines, parser=parser_used)
+                else:
+                    raise
+
             payload = {
-                "recipeIngredient": build_plain_repaired_ingredients(
+                "recipeIngredient": build_structured_repaired_ingredients(
                     lines,
                     titles_by_index,
+                    parsed,
                     existing_ingredients,
+                    client,
                 )
             }
 
@@ -1037,6 +1274,7 @@ def run_placeholder_repair(
                     "title": title,
                     "status": "ingredients_repaired",
                     "slug": slug,
+                    "parser": parser_used,
                 },
             )
             print(f"Repaired: {title}")
@@ -1504,7 +1742,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repair-placeholder-ingredients",
         action="store_true",
-        help="Repair imported recipes that still have the Mealie placeholder ingredient",
+        help="Repair imported recipes by parsing original Mela ingredient lines into Mealie structured ingredients",
     )
     parser.add_argument(
         "--repair-authors",
@@ -1515,6 +1753,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--placeholder-only",
         action="store_true",
         help="When repairing, only touch recipes that currently have the placeholder ingredient",
+    )
+    parser.add_argument(
+        "--all-ingredients",
+        action="store_true",
+        help="When repairing ingredients, process all mapped recipes (default is unparsed-only for safety)",
+    )
+    parser.add_argument(
+        "--ingredient-parser",
+        default="nlp",
+        help="Mealie parser to use for ingredient repair (default: nlp)",
     )
     parser.add_argument(
         "--author-only-missing",
