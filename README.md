@@ -200,9 +200,10 @@ python3 mela_to_mealie_import.py Recipes.melarecipes \
   --dry-run
 ```
 
-### Repair source authors
+### Repair source authors and metadata tags
 
 If you want visible source-author attribution in Mealie, the importer can infer authors from common title patterns and store them in both `extras.sourceAuthor` and a visible `Source Author` note.
+It also adds filterable tags such as `author: Rachel Roddy` and `series: The perfect` when inferred.
 
 ```bash
 python3 mela_to_mealie_import.py Recipes.melarecipes \

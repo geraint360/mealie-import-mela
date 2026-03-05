@@ -368,6 +368,64 @@ def source_author_from_recipe(recipe: dict | None) -> str | None:
     return None
 
 
+def is_probable_series_name(candidate: str | None) -> bool:
+    if not candidate:
+        return False
+    value = candidate.strip(" -.,;:|")
+    if not value:
+        return False
+    lowered = value.lower()
+    blocked_exact = {
+        "the guardian",
+        "food",
+        "recipe",
+        "recipes",
+        "cup of jo",
+    }
+    if lowered in blocked_exact:
+        return False
+    if is_probable_person_name(value):
+        return False
+    words = value.split()
+    return 2 <= len(words) <= 6
+
+
+def extract_series_name(mela_recipe: dict) -> str | None:
+    title = (mela_recipe.get("title") or "").strip()
+    if not title:
+        return None
+
+    if re.match(r"^the perfect\b", title, flags=re.IGNORECASE):
+        return "The perfect"
+    if re.match(r"^ask ottolenghi\s*:", title, flags=re.IGNORECASE):
+        return "Ask Ottolenghi"
+
+    if ":" in title:
+        prefix = title.split(":", 1)[0].strip()
+        if is_probable_series_name(prefix):
+            return prefix
+
+    if "|" in title:
+        suffix = title.rsplit("|", 1)[1].strip()
+        if is_probable_series_name(suffix):
+            return suffix
+
+    return None
+
+
+def inferred_metadata_tag_names(mela_recipe: dict) -> list[str]:
+    names: list[str] = []
+    source_author = extract_source_author(mela_recipe)
+    if source_author:
+        names.append(f"author: {source_author}")
+
+    series_name = extract_series_name(mela_recipe)
+    if series_name:
+        names.append(f"series: {series_name}")
+
+    return names
+
+
 def is_probable_person_name(candidate: str | None) -> bool:
     if not candidate:
         return False
@@ -502,7 +560,36 @@ def selected_tags(mela_recipe: dict, tag_lookup: dict) -> list[dict]:
         tags.append(tag_lookup["favorite"])
     if mela_recipe.get("wantToCook") and "want-to-cook" in tag_lookup:
         tags.append(tag_lookup["want-to-cook"])
+    for name in inferred_metadata_tag_names(mela_recipe):
+        slug = slugify(name)
+        if slug in tag_lookup:
+            tags.append(tag_lookup[slug])
     return tags
+
+
+def merged_tags(existing_tags: list | None, additional_tags: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+
+    for tag in existing_tags or []:
+        if not isinstance(tag, dict):
+            continue
+        key = str(tag.get("id") or slugify(tag.get("name") or ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(tag))
+
+    for tag in additional_tags:
+        if not isinstance(tag, dict):
+            continue
+        key = str(tag.get("id") or slugify(tag.get("name") or ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(tag))
+
+    return merged
 
 
 def selected_categories(mela_recipe: dict, category_lookup: dict) -> list[dict]:
@@ -1332,6 +1419,7 @@ def run_author_repair(
     updated = 0
     skipped = 0
     errors = 0
+    metadata_tag_cache: dict[str, dict] = {}
 
     for identity, slug in slug_map.items():
         entry = source_lookup.get(identity)
@@ -1345,6 +1433,7 @@ def run_author_repair(
             continue
 
         source_author = extract_source_author(entry.recipe)
+        metadata_tag_names = inferred_metadata_tag_names(entry.recipe)
 
         checked += 1
         if checked % 250 == 0:
@@ -1359,40 +1448,66 @@ def run_author_repair(
             existing_extras = current_recipe.get("extras")
             existing_notes = current_recipe.get("notes")
             existing_author = source_author_from_recipe(current_recipe)
+            existing_tags = current_recipe.get("tags") or []
+            existing_tag_slugs = {
+                slugify(tag.get("name") or "")
+                for tag in existing_tags
+                if isinstance(tag, dict) and (tag.get("name") or "").strip()
+            }
 
+            desired_metadata_tags: list[dict] = []
+            missing_metadata_tag_names: list[str] = []
+            for name in metadata_tag_names:
+                name_slug = slugify(name)
+                if not name_slug or name_slug in existing_tag_slugs:
+                    continue
+                organizer = metadata_tag_cache.get(name_slug)
+                if organizer is None:
+                    organizer = client.safe_get_or_create_organizer("tags", name)
+                    if organizer:
+                        metadata_tag_cache[name_slug] = organizer
+                if organizer:
+                    desired_metadata_tags.append(organizer)
+                    missing_metadata_tag_names.append(name)
+
+            author_needs_update = False
             if args.author_only_missing:
-                if existing_author:
-                    skipped += 1
-                    continue
+                author_needs_update = bool(source_author and not existing_author)
             else:
-                if source_author == existing_author:
-                    skipped += 1
-                    continue
+                author_needs_update = source_author != existing_author
 
             action_label = "Updated author"
             payload: dict | None = None
 
-            if source_author:
+            if author_needs_update and source_author:
                 payload = {
                     "notes": merged_notes(existing_notes, source_author),
                     "extras": merged_extras(existing_extras, source_author),
                 }
-            else:
+            elif author_needs_update and not source_author:
                 if existing_author and not is_probable_person_name(existing_author):
                     payload = {
                         "notes": merged_notes(existing_notes, None),
                         "extras": merged_extras(existing_extras, None),
                     }
                     action_label = "Cleared non-person author"
-                else:
-                    skipped += 1
-                    continue
+
+            if desired_metadata_tags:
+                if payload is None:
+                    payload = {}
+                payload["tags"] = merged_tags(existing_tags, desired_metadata_tags)
+
+            if payload is None:
+                skipped += 1
+                continue
 
             if args.dry_run:
-                if source_author:
+                if source_author and author_needs_update:
                     print(f"Would set author '{source_author}' on: {title}")
-                else:
+                elif author_needs_update:
                     print(f"Would clear non-person author on: {title}")
+                if missing_metadata_tag_names:
+                    print(f"Would add tags {missing_metadata_tag_names}: {title}")
                 updated += 1
                 if args.limit is not None and updated >= args.limit:
                     break
@@ -1408,12 +1523,15 @@ def run_author_repair(
                     "status": "author_repaired",
                     "slug": slug,
                     "source_author": source_author,
+                    "metadata_tags_added": missing_metadata_tag_names,
                 },
             )
-            if source_author:
+            if source_author and author_needs_update:
                 print(f"{action_label} '{source_author}': {title}")
-            else:
+            elif author_needs_update:
                 print(f"{action_label}: {title}")
+            if missing_metadata_tag_names:
+                print(f"Added tags {missing_metadata_tag_names}: {title}")
             updated += 1
             time.sleep(args.delay_seconds)
 
@@ -1568,6 +1686,8 @@ def run_import(args: argparse.Namespace) -> int:
                 tag_names.add("favorite")
             if entry.recipe.get("wantToCook"):
                 tag_names.add("want-to-cook")
+            for name in inferred_metadata_tag_names(entry.recipe):
+                tag_names.add(name)
 
         category_lookup: dict[str, dict] = {}
         for name in category_names:
