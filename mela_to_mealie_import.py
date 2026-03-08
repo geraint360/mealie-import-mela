@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -40,6 +41,26 @@ def slugify(text: str) -> str:
     text = re.sub(r"[\s_]+", "-", text)
     text = re.sub(r"-+", "-", text)
     return text.strip("-")
+
+
+TRACKING_PREFIXES = ("utm_",)
+TRACKING_EXACT = {"fbclid", "gclid"}
+
+
+def canonicalise(url: str) -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlsplit(text)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    filtered = [
+        (key, value)
+        for key, value in query_items
+        if not (key.lower().startswith(TRACKING_PREFIXES) or key.lower() in TRACKING_EXACT)
+    ]
+    filtered.sort()
+    normalized = parsed._replace(fragment="", query=urllib.parse.urlencode(filtered))
+    return urllib.parse.urlunsplit(normalized)
 
 
 def parse_time_to_iso(time_str: str | None) -> str | None:
@@ -201,12 +222,52 @@ def has_unparsed_ingredients(existing_ingredients: list[dict]) -> bool:
             continue
         note = (ingredient.get("note") or "").strip()
         display = (ingredient.get("display") or "").strip()
-        quantity = ingredient.get("quantity")
         unit = ingredient.get("unit")
         food = ingredient.get("food")
-        if (note or display) and not unit and not food and (quantity in (None, 0, 0.0)):
+        if (note or display) and not unit and not food:
             return True
     return False
+
+
+def normalise_text(value: str | None) -> str:
+    if not value:
+        return ""
+    text = value.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def note_has_useful_qualifier(note: str) -> bool:
+    qualifiers = (
+        "to serve",
+        "plus extra",
+        "for garnish",
+        "to garnish",
+        "optional",
+        "room temperature",
+        "finely chopped",
+        "roughly chopped",
+        "chopped",
+        "sliced",
+        "diced",
+        "crushed",
+        "divided",
+    )
+    n = normalise_text(note)
+    return any(token in n for token in qualifiers)
+
+
+def cleaned_note(note: str | None, original_line: str, display: str) -> str:
+    n = normalise_text(note)
+    o = normalise_text(original_line)
+    d = normalise_text(display)
+    if not n:
+        return original_line
+    if n == o or n == d:
+        return ""
+    if o and n in o and not note_has_useful_qualifier(note or ""):
+        return ""
+    return note or ""
 
 
 def build_plain_repaired_ingredients(
@@ -281,13 +342,14 @@ def build_structured_repaired_ingredients(
             raw_title = ingredient.get("title")
             title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
 
-        note = ingredient.get("note")
-        if not isinstance(note, str) or not note.strip():
-            note = line
-
         display = ingredient.get("display")
         if not isinstance(display, str) or not display.strip():
             display = line
+
+        note = ingredient.get("note")
+        if not isinstance(note, str) or not note.strip():
+            note = line
+        note = cleaned_note(note, line, display)
 
         original_text = ingredient.get("originalText")
         if not isinstance(original_text, str) or not original_text.strip():
@@ -1037,6 +1099,33 @@ class MealieClient:
     def recipe_slug_exists(self, slug: str) -> bool:
         return self.recipe_exists_by_slug(slug)
 
+    def find_recipe_slug_by_org_url(self, url: str) -> str | None:
+        canonical = canonicalise(url)
+        if not canonical:
+            return None
+
+        try:
+            response = self.request_with_retry(
+                "GET",
+                f"{self.base_url}/api/recipes",
+                params={"search": canonical, "perPage": 200},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            print(f"  Warning: could not search recipes by orgURL '{canonical}': {exc}")
+            return None
+
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+
+        for item in (response.json() or {}).get("items") or []:
+            org_url = (item.get("orgURL") or item.get("orgUrl") or "").strip()
+            slug = (item.get("slug") or "").strip()
+            if slug and canonicalise(org_url) == canonical:
+                return slug
+        return None
+
     def get_recipe(self, slug: str) -> dict | None:
         response = self.request_with_retry(
             "GET",
@@ -1728,6 +1817,28 @@ def run_import(args: argparse.Namespace) -> int:
                 continue
 
             candidate_slug = slugify(title)
+            source_link = (entry.recipe.get("link") or "").strip()
+            if source_link:
+                existing_by_url_slug = client.find_recipe_slug_by_org_url(source_link)
+                if existing_by_url_slug:
+                    record_state(state, entry, "skipped_existing", slug=existing_by_url_slug)
+                    save_state(state_path, state)
+                    append_log(
+                        log_path,
+                        {
+                            "timestamp": now_utc_iso(),
+                            "index": entry.index,
+                            "identity": identity,
+                            "title": title,
+                            "status": "skipped_existing",
+                            "slug": existing_by_url_slug,
+                            "reason": "org_url_exists",
+                            "org_url": canonicalise(source_link),
+                        },
+                    )
+                    print(f"  Skipped existing recipe /recipe/{existing_by_url_slug} (matched orgURL)")
+                    continue
+
             if not known_slug and client.recipe_exists_by_slug(candidate_slug):
                 record_state(state, entry, "skipped_existing", slug=candidate_slug)
                 save_state(state_path, state)
